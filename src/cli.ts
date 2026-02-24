@@ -25,7 +25,7 @@ program
 program
     .option('-p, --port <port>', 'Port to run the proxy server on', '3080')
     .option('-r, --reconfigure', 'Force reconfiguration even if config exists')
-    .option('--no-claude-settings', 'Skip updating Claude Code settings files')
+    .option('--claude-settings', 'Enable updating Claude Code settings files')
     .action(async (options) => {
         UI.banner();
         UI.header('Adapt any model for Claude Code');
@@ -39,7 +39,7 @@ program
                 updateClaudeJson();
                 UI.statusDone(true, 'Initialized Claude Adapter');
             } else {
-                UI.info('Skipping Claude settings update (--no-claude-settings)');
+                UI.info('Claude Code settings not updated (use --claude-settings to enable)');
             }
 
             // Step 2: Load or create configuration
@@ -84,7 +84,6 @@ program
                     { label: 'Haiku', value: config.models.haiku }
                 ]);
             } else {
-                UI.info('Claude Code settings not updated (use manual configuration)');
                 UI.hint(`Set ANTHROPIC_BASE_URL=${proxyUrl} in your Claude Code settings`);
             }
 
