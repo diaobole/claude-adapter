@@ -48,7 +48,8 @@ function modifySystemPromptForClaudeAdapter(systemContent: string): string {
 export function convertRequestToOpenAI(
     anthropicRequest: AnthropicMessageRequest,
     targetModel: string,
-    toolFormat: 'native' | 'xml' = 'native'
+    toolFormat: 'native' | 'xml' = 'native',
+    maxTokensCap?: number
 ): OpenAIChatRequest {
     const messages: OpenAIMessage[] = [];
 
@@ -98,7 +99,11 @@ export function convertRequestToOpenAI(
     // Claude Code uses max_tokens: 1 for prompt caching optimization,
     // but this causes 400 errors with Azure OpenAI. Convert to 32 to allow
     // at least a brief acknowledgment or the start of a tool call.
-    const maxTokens = anthropicRequest.max_tokens === 1 ? 32 : anthropicRequest.max_tokens;
+    // If maxTokensCap is provided, use the minimum of requested and capped values.
+    let maxTokens = anthropicRequest.max_tokens === 1 ? 32 : anthropicRequest.max_tokens;
+    if (maxTokensCap !== undefined && maxTokens > maxTokensCap) {
+        maxTokens = maxTokensCap;
+    }
 
     const openaiRequest: OpenAIChatRequest = {
         model: targetModel,

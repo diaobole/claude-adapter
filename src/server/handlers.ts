@@ -15,6 +15,10 @@ import { recordError } from '../utils/errorLog';
 // Request ID counter for unique identification
 let requestIdCounter = 0;
 
+// Cache for provider max_tokens limits (cleared on restart)
+// Key: provider baseUrl, Value: max_tokens upper limit
+const maxTokensCache = new Map<string, number>();
+
 function generateRequestId(): string {
     requestIdCounter++;
     const timestamp = Date.now().toString(36);
@@ -58,8 +62,19 @@ export function createMessagesHandler(config: AdapterConfig) {
             // Determine tool calling style from config
             const toolStyle = config.toolFormat || 'native';
 
+            // Check if we have a cached max_tokens limit for this provider
+            const cachedMaxTokens = maxTokensCache.get(config.baseUrl);
+            if (cachedMaxTokens) {
+                log.debug(`Using cached max_tokens limit: ${cachedMaxTokens}`);
+            }
+
             // Convert request to OpenAI format
-            const openaiRequest = convertRequestToOpenAI(anthropicRequest, targetModel, toolStyle);
+            const openaiRequest = convertRequestToOpenAI(
+                anthropicRequest,
+                targetModel,
+                toolStyle,
+                cachedMaxTokens
+            );
 
             // Log tool calling mode when tools are present
             if (toolStyle === 'xml' && anthropicRequest.tools?.length) {
@@ -90,6 +105,18 @@ export function createMessagesHandler(config: AdapterConfig) {
 }
 
 /**
+ * Parse max_tokens limit from error message
+ * Format: "max_tokens range is [min, max]"
+ */
+function parseMaxTokensLimit(errorMessage: string): number | null {
+    const match = errorMessage.match(/max_tokens range is \[\d+, (\d+)\]/);
+    if (match) {
+        return parseInt(match[1], 10);
+    }
+    return null;
+}
+
+/**
  * Handle non-streaming API request
  */
 async function handleNonStreamingRequest(
@@ -102,31 +129,79 @@ async function handleNonStreamingRequest(
 ): Promise<void> {
     log.debug('Making non-streaming request');
 
-    const response = await openai.chat.completions.create({
-        ...openaiRequest,
-        stream: false,
-    });
-
-    log.debug('Response received', {
-        finishReason: response.choices[0]?.finish_reason,
-        usage: response.usage
-    });
-
-    // Record token usage
-    if (response.usage) {
-        recordUsage({
-            provider,
-            modelName: originalModel,
-            model: response.model,
-            inputTokens: response.usage.prompt_tokens,
-            outputTokens: response.usage.completion_tokens,
-            cachedInputTokens: response.usage.prompt_tokens_details?.cached_tokens,
-            streaming: false
+    try {
+        const response = await openai.chat.completions.create({
+            ...openaiRequest,
+            stream: false,
         });
-    }
 
-    const anthropicResponse = convertResponseToAnthropic(response as any, originalModel);
-    reply.send(anthropicResponse);
+        log.debug('Response received', {
+            finishReason: response.choices[0]?.finish_reason,
+            usage: response.usage
+        });
+
+        // Record token usage
+        if (response.usage) {
+            recordUsage({
+                provider,
+                modelName: originalModel,
+                model: response.model,
+                inputTokens: response.usage.prompt_tokens,
+                outputTokens: response.usage.completion_tokens,
+                cachedInputTokens: response.usage.prompt_tokens_details?.cached_tokens,
+                streaming: false
+            });
+        }
+
+        const anthropicResponse = convertResponseToAnthropic(response as any, originalModel);
+        reply.send(anthropicResponse);
+    } catch (error: any) {
+        // Check if this is a max_tokens validation error
+        if (error?.status === 400 && error?.message) {
+            const maxTokensLimit = parseMaxTokensLimit(error.message);
+            if (maxTokensLimit !== null) {
+                log.info(`Detected max_tokens limit: ${maxTokensLimit}, caching and retrying`);
+
+                // Cache the limit for future requests
+                maxTokensCache.set(provider, maxTokensLimit);
+
+                // Adjust max_tokens and retry
+                if (openaiRequest.max_tokens > maxTokensLimit) {
+                    openaiRequest.max_tokens = maxTokensLimit;
+                    log.info(`Retrying with max_tokens: ${maxTokensLimit}`);
+
+                    const response = await openai.chat.completions.create({
+                        ...openaiRequest,
+                        stream: false,
+                    });
+
+                    log.debug('Retry response received', {
+                        finishReason: response.choices[0]?.finish_reason,
+                        usage: response.usage
+                    });
+
+                    // Record token usage
+                    if (response.usage) {
+                        recordUsage({
+                            provider,
+                            modelName: originalModel,
+                            model: response.model,
+                            inputTokens: response.usage.prompt_tokens,
+                            outputTokens: response.usage.completion_tokens,
+                            cachedInputTokens: response.usage.prompt_tokens_details?.cached_tokens,
+                            streaming: false
+                        });
+                    }
+
+                    const anthropicResponse = convertResponseToAnthropic(response as any, originalModel);
+                    reply.send(anthropicResponse);
+                    return;
+                }
+            }
+        }
+        // Re-throw if not a max_tokens error or retry failed
+        throw error;
+    }
 }
 
 /**
@@ -142,13 +217,43 @@ async function handleStreamingRequest(
 ): Promise<void> {
     log.debug('Making streaming request');
 
-    const stream = await openai.chat.completions.create({
-        ...openaiRequest,
-        stream: true,
-    } as OpenAI.ChatCompletionCreateParamsStreaming);
+    try {
+        const stream = await openai.chat.completions.create({
+            ...openaiRequest,
+            stream: true,
+        } as OpenAI.ChatCompletionCreateParamsStreaming);
 
-    await streamOpenAIToAnthropic(stream as any, reply, originalModel, provider);
-    log.debug('Streaming completed');
+        await streamOpenAIToAnthropic(stream as any, reply, originalModel, provider);
+        log.debug('Streaming completed');
+    } catch (error: any) {
+        // Check if this is a max_tokens validation error
+        if (error?.status === 400 && error?.message) {
+            const maxTokensLimit = parseMaxTokensLimit(error.message);
+            if (maxTokensLimit !== null) {
+                log.info(`Detected max_tokens limit: ${maxTokensLimit}, caching and retrying`);
+
+                // Cache the limit for future requests
+                maxTokensCache.set(provider, maxTokensLimit);
+
+                // Adjust max_tokens and retry
+                if (openaiRequest.max_tokens > maxTokensLimit) {
+                    openaiRequest.max_tokens = maxTokensLimit;
+                    log.info(`Retrying with max_tokens: ${maxTokensLimit}`);
+
+                    const stream = await openai.chat.completions.create({
+                        ...openaiRequest,
+                        stream: true,
+                    } as OpenAI.ChatCompletionCreateParamsStreaming);
+
+                    await streamOpenAIToAnthropic(stream as any, reply, originalModel, provider);
+                    log.debug('Retry streaming completed');
+                    return;
+                }
+            }
+        }
+        // Re-throw if not a max_tokens error or retry failed
+        throw error;
+    }
 }
 
 /**
@@ -164,13 +269,43 @@ async function handleXmlStreamingRequest(
 ): Promise<void> {
     log.debug('Making XML streaming request (experimental)');
 
-    const stream = await openai.chat.completions.create({
-        ...openaiRequest,
-        stream: true,
-    } as OpenAI.ChatCompletionCreateParamsStreaming);
+    try {
+        const stream = await openai.chat.completions.create({
+            ...openaiRequest,
+            stream: true,
+        } as OpenAI.ChatCompletionCreateParamsStreaming);
 
-    await streamXmlOpenAIToAnthropic(stream as any, reply, originalModel, provider);
-    log.debug('XML streaming completed');
+        await streamXmlOpenAIToAnthropic(stream as any, reply, originalModel, provider);
+        log.debug('XML streaming completed');
+    } catch (error: any) {
+        // Check if this is a max_tokens validation error
+        if (error?.status === 400 && error?.message) {
+            const maxTokensLimit = parseMaxTokensLimit(error.message);
+            if (maxTokensLimit !== null) {
+                log.info(`Detected max_tokens limit: ${maxTokensLimit}, caching and retrying`);
+
+                // Cache the limit for future requests
+                maxTokensCache.set(provider, maxTokensLimit);
+
+                // Adjust max_tokens and retry
+                if (openaiRequest.max_tokens > maxTokensLimit) {
+                    openaiRequest.max_tokens = maxTokensLimit;
+                    log.info(`Retrying with max_tokens: ${maxTokensLimit}`);
+
+                    const stream = await openai.chat.completions.create({
+                        ...openaiRequest,
+                        stream: true,
+                    } as OpenAI.ChatCompletionCreateParamsStreaming);
+
+                    await streamXmlOpenAIToAnthropic(stream as any, reply, originalModel, provider);
+                    log.debug('Retry XML streaming completed');
+                    return;
+                }
+            }
+        }
+        // Re-throw if not a max_tokens error or retry failed
+        throw error;
+    }
 }
 
 /**
